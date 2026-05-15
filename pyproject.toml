@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regchem-sentinel"
+version = "0.1.0"
+description = "Auditable decision-support for Starting Material and supplier cues in CMC narratives (NDA/ANDA-style unstructured text)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "RegChem Sentinel Maintainers" }]
+keywords = [
+    "compliance",
+    "gxp",
+    "cmc",
+    "starting-material",
+    "streamlit",
+    "provenance",
+    "audit",
+]
+dependencies = [
+    "pydantic>=2.10.0",
+    "sqlalchemy>=2.0.36",
+    "sqlmodel>=0.0.22",
+    "pydantic-settings>=2.6.0",
+    "streamlit>=1.40.0",
+    "pandas>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13.0",
+    "ruff>=0.8.0",
+    "pytest>=8.3.0",
+    "pytest-cov>=6.0.0",
+    "pandas-stubs>=2.2.0",
+    "types-python-dateutil>=2.9.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+regchem_sentinel = ["py.typed"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests", "app.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["regchem_sentinel"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+show_error_codes = true
+mypy_path = ["src"]
+files = ["src/regchem_sentinel", "tests", "app.py"]
+
+[[tool.mypy.overrides]]
+module = ["streamlit.*", "streamlit"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+filterwarnings = [
+    "error",
+    "ignore:.*Pyarrow.*:DeprecationWarning",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+fail_under = 0
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "\\.\\.\\.",
+]

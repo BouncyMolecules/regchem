@@ -1,0 +1,5 @@
+# Runtime pins for Streamlit Cloud / simple deploys — keep aligned with ``pyproject.toml``.
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+streamlit>=1.40.0
+pandas>=2.2.0
