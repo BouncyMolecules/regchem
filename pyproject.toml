@@ -20,12 +20,14 @@ keywords = [
     "audit",
 ]
 dependencies = [
+    "pandas>=2.2.0",
+    "plotly>=5.24.0",
     "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.1",
     "sqlalchemy>=2.0.36",
     "sqlmodel>=0.0.22",
-    "pydantic-settings>=2.6.0",
     "streamlit>=1.40.0",
-    "pandas>=2.2.0",
 ]
 
 [project.optional-dependencies]
