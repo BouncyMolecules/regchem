@@ -12,6 +12,8 @@ from regchem_sentinel.ui.pages import classify
 def test_classify_page_exits_early_before_run() -> None:
     fake_st = MagicMock()
     fake_st.button.return_value = False
+    fake_st.columns.side_effect = lambda *_a, **_k: (MagicMock(), MagicMock())
+    fake_st.file_uploader.return_value = None
     settings = Settings(app_env="development", build_id="pytest", storage_backend="memory")
     deps = default_dependencies(settings)
 
