@@ -172,7 +172,7 @@ Dependency construction happens in **`regchem_sentinel.ui.app`**; shared objects
 
 - **Source & roadmap:** [`github.com/BouncyMolecules/regchem`](https://github.com/BouncyMolecules/regchem)
 - **Writing — Clinical Future *(Substack)*:** [`clinicalfuture.substack.com`](https://clinicalfuture.substack.com/)
-- **LinkedIn *(update slug):*** [`linkedin.com/in/USERNAME`](https://www.linkedin.com/in/USERNAME/)
+- **LinkedIn *(update slug):*** [`linkedin.com/in/USERNAME`](https://www.linkedin.com/in/elahalilovic/)
 
 ---
 
