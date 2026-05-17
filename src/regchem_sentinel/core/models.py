@@ -360,6 +360,19 @@ class SentinelPipelineSnapshot(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _extended_table_args(
+    *indexes: Index,
+) -> tuple[Index | dict[str, bool], ...]:
+    """Return index rows plus declarative kwargs for SQLite ORM binds.
+
+    ``extend_existing`` allows Streamlit’s module watcher / ``importlib.reload`` to reconcile
+    redefined ``SQLModel`` classes against the shared ``SQLModel.metadata`` singleton without an
+    ``InvalidRequestError`` on duplicate logical table names.
+    """
+
+    return (*indexes, {"extend_existing": True}) if indexes else ({"extend_existing": True},)
+
+
 class PipelineRunRecord(SQLModel, table=True):
     """Root immutable row for a single ``run_pipeline`` persistence event.
 
@@ -369,7 +382,7 @@ class PipelineRunRecord(SQLModel, table=True):
     """
 
     __tablename__ = "pipeline_run"
-    __table_args__ = (
+    __table_args__ = _extended_table_args(
         Index("ix_pipeline_run_corr_created", "correlation_id", "created_at_utc"),
         Index("ix_pipeline_run_created", "created_at_utc"),
     )
@@ -386,7 +399,7 @@ class ParsedSubmissionRecord(SQLModel, table=True):
     """Persisted parse artefact (1:1 with a pipeline run)."""
 
     __tablename__ = "parsed_submission"
-    __table_args__ = (Index("ix_parsed_submission_sha", "content_sha256_hex"),)
+    __table_args__ = _extended_table_args(Index("ix_parsed_submission_sha", "content_sha256_hex"))
 
     id: str = SQLField(primary_key=True, max_length=36)
     pipeline_run_id: str = SQLField(
@@ -409,7 +422,7 @@ class StartingMaterialRecord(SQLModel, table=True):
     """Material hypothesis row with embedded justification / provenance JSON."""
 
     __tablename__ = "starting_material"
-    __table_args__ = (
+    __table_args__ = _extended_table_args(
         Index("ix_starting_material_run_seq", "pipeline_run_id", "sequence_index"),
         Index("ix_starting_material_name", "canonical_name"),
     )
@@ -434,7 +447,7 @@ class ClassificationResultRecord(SQLModel, table=True):
     """Structured classifier emission tied 1:1 to a persisted starting-material row."""
 
     __tablename__ = "classification_result"
-    __table_args__ = (Index("ix_classification_run", "pipeline_run_id"),)
+    __table_args__ = _extended_table_args(Index("ix_classification_run", "pipeline_run_id"))
 
     id: str = SQLField(primary_key=True, max_length=36)
     pipeline_run_id: str = SQLField(foreign_key="pipeline_run.id", nullable=False, index=True)
@@ -462,7 +475,7 @@ class SupplierRecord(SQLModel, table=True):
     """Persisted supplier / testing-org linkage surfaced by the linker."""
 
     __tablename__ = "supplier"
-    __table_args__ = (
+    __table_args__ = _extended_table_args(
         Index("ix_supplier_run_seq", "pipeline_run_id", "sequence_index"),
         Index("ix_supplier_display", "supplier_display_name"),
     )
@@ -487,7 +500,7 @@ class VerificationAssertionRecord(SQLModel, table=True):
     """Verifier bundle for a pipeline run (assertion-level provenance)."""
 
     __tablename__ = "verification_assertion"
-    __table_args__ = (
+    __table_args__ = _extended_table_args(
         Index("ix_verification_run_seq", "pipeline_run_id", "sequence_index"),
         Index("ix_verification_status", "verification_status"),
     )
@@ -513,7 +526,7 @@ class VerificationCueResultRecord(SQLModel, table=True):
     """Exploded verifier cue rows for indexed review of cue-level outcomes."""
 
     __tablename__ = "verification_cue_result"
-    __table_args__ = (
+    __table_args__ = _extended_table_args(
         Index("ix_cue_run_cue_id", "pipeline_run_id", "cue_stable_id"),
         Index("ix_cue_assertion_seq", "verification_assertion_id", "sequence_index"),
     )
@@ -536,6 +549,40 @@ class VerificationCueResultRecord(SQLModel, table=True):
     )
 
 
+class GraphMemoryLedgerEntry(SQLModel, table=True):
+    """Append-only hypergraph ledger row (hash-chained; higher-order edge upserts only)."""
+
+    __tablename__ = "graph_memory_ledger_entry"
+    __table_args__ = _extended_table_args(
+        Index("ix_graph_memory_corr_created", "correlation_id", "created_at_utc"),
+        Index("ix_graph_memory_hyperedge_key", "hyperedge_key_sha256"),
+        Index("ix_graph_memory_snapshot_sha", "snapshot_canonical_sha256"),
+        Index("ix_graph_memory_run", "pipeline_run_id"),
+    )
+
+    entry_id: int | None = SQLField(default=None, primary_key=True)
+    public_id: str = SQLField(nullable=False, unique=True, index=True, max_length=36)
+    created_at_utc: datetime = SQLField(nullable=False, index=True)
+    event_type: str = SQLField(nullable=False, max_length=64)
+    user_action: str = SQLField(nullable=False, max_length=128)
+    correlation_id: str = SQLField(nullable=False, index=True, max_length=512)
+    pipeline_run_id: str | None = SQLField(
+        default=None, foreign_key="pipeline_run.id", nullable=True, index=True, max_length=36
+    )
+    snapshot_canonical_sha256: str = SQLField(nullable=False, max_length=64, index=True)
+    hyperedge_key_sha256: str = SQLField(nullable=False, max_length=64, index=True)
+    relation_type: str = SQLField(nullable=False, max_length=128)
+    strength_before: float = SQLField(nullable=False)
+    strength_delta: float = SQLField(nullable=False)
+    strength_after: float = SQLField(nullable=False)
+    participants_canonical_json: str = SQLField(sa_column=Column(Text, nullable=False))
+    previous_hyperedge_state_hash_hex: str | None = SQLField(default=None, max_length=64)
+    hyperedge_state_hash_hex: str = SQLField(nullable=False, max_length=64)
+    payload_json: str = SQLField(sa_column=Column(Text, nullable=False))
+    previous_ledger_hash_hex: str | None = SQLField(default=None, max_length=64)
+    entry_hash_hex: str = SQLField(nullable=False, max_length=64, index=True)
+
+
 class AuditTrailEntry(SQLModel, table=True):
     """Append-only integrity-oriented audit ledger row (hash-chained where supported).
 
@@ -544,7 +591,7 @@ class AuditTrailEntry(SQLModel, table=True):
     """
 
     __tablename__ = "audit_trail_entry"
-    __table_args__ = (
+    __table_args__ = _extended_table_args(
         Index("ix_audit_corr_entry", "correlation_id", "entry_id"),
         Index("ix_audit_run", "pipeline_run_id"),
     )
@@ -571,6 +618,7 @@ __all__ = [
     "DatabaseLookupRecord",
     "DecisionProvenance",
     "DetectorTier",
+    "GraphMemoryLedgerEntry",
     "MaterialTier",
     "ParsedSubmission",
     "ParsedSubmissionRecord",

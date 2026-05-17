@@ -26,10 +26,11 @@ def _as_tuple(value: object) -> tuple[object, ...]:
 
 def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
     _ = settings
-    st.title("History & audit")
-    st.write(
-        "Filter stored pipeline snapshots within this browser session. Expand any row for the "
-        "full trace bundle — findings, supplier graph, verifier assertions, and ledger payloads."
+    st.markdown(
+        '<p class="regchem-page-lede" style="margin-top:0.25rem;">Every row below is an <strong>immutable snapshot '
+        "reference</strong> — use correlation IDs and digests when binding Quanta output to your quality records. "
+        "This view is filtered to this workstation&rsquo;s ledger.</p>",
+        unsafe_allow_html=True,
     )
 
     try:
@@ -41,7 +42,7 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
         return
 
     filter_text = st.text_input(
-        "Correlation filter (substring)",
+        "Filter by correlation (partial match)",
         value="",
         help="Narrows matching correlation identifiers.",
     ).strip()
@@ -56,10 +57,10 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
 
     if not rows:
         st.info(
-            "No executions match your filter yet. Submit a classify run — persistence defaults "
-            "to SQLite under your configured ``data_dir`` unless you deliberately select memory "
-            "backend."
+            "No executions match your filter yet. Run **New classification** — persistence defaults "
+            "to SQLite under your configured ``data_dir`` unless you deliberately select the memory backend."
         )
+        theme.render_validation_footer(st)
         return
 
     table_rows: list[dict[str, object]] = []
@@ -79,15 +80,19 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
                 "finding_count": len(findings),
                 "review_open": sum(1 for v in ver_counts if v.status.value == "review_required"),
                 "rejected": sum(1 for v in ver_counts if v.status.value == "rejected"),
-                "content_sha256": row.get("content_sha256"),
-                "snapshot_digest": row.get("snapshot_canonical_sha256"),
+                "submission_content_sha256": row.get("content_sha256"),
+                "canonical_snapshot_sha256": row.get("snapshot_canonical_sha256"),
             }
         )
 
-    st.subheader("Snapshot index")
+    st.markdown("##### Snapshot index")
+    st.caption(
+        "Sorted newest-first within the retention window — **canonical snapshot SHA-256** is the bundle digest "
+        "stored with each run."
+    )
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
-    st.subheader("Full trace")
+    st.markdown("##### Detailed trace")
     correlation_ids = sorted(
         {str(item.get("correlation_id")) for item in rows if item.get("correlation_id")}
     )
@@ -132,10 +137,22 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
     )
 
     st.markdown(
+        """
+        <div class="regchem-card-surface">
+            <div class="regchem-page-eyebrow">Selected run · provenance</div>
+            <p class="regchem-footnote" style="margin:0;">
+                Treat these identifiers as the immutable snapshot references for QA narratives, deviations, and
+                inspection talking points. Download JSON to attach to your ECM bundle.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
         f"**Pipeline run ID:** `{selected_row.get('pipeline_run_id', '—')}`  \n"
         f"**Opened (UTC):** `{selected_row.get('created_at_utc', '—')}`  \n"
-        f"**Content SHA-256:** `{selected_row.get('content_sha256', '—')}`  \n"
-        f"**Snapshot digest:** `{selected_row.get('snapshot_canonical_sha256', '—')}`"
+        f"**Submission content SHA-256:** `{selected_row.get('content_sha256', '—')}`  \n"
+        f"**Canonical snapshot SHA-256:** `{selected_row.get('snapshot_canonical_sha256', '—')}`"
     )
 
     accepted_h = sum(1 for v in verifications if v.status is VerificationStatus.ACCEPTED)
@@ -152,7 +169,7 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
     st.download_button(
         label="Download canonical snapshot JSON",
         data=bundle.model_dump_json(indent=2),
-        file_name=f"regchem_history_{bundle.correlation_id}.json",
+        file_name=f"quanta_history_{bundle.correlation_id}.json",
         mime="application/json",
         key=f"hist_dl_{bundle.correlation_id}",
     )
@@ -169,7 +186,7 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
             }
         )
 
-    st.subheader("Immutable audit ledger (subset)")
+    st.markdown("##### Hash-chained audit ledger (replay subset)")
     filtered_trail = [entry for entry in trail if entry.correlation_id == selected]
 
     ledger_rows: list[dict[str, object]] = []
@@ -201,6 +218,8 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
                 st.code(entry.payload_json)
 
     st.caption(
-        "Production deployments should mirror this ledger to WORM media and tie hash chains to "
-        "your Part 11 / Annex 11 evidence packages."
+        "Ledger rows are append-only in Quanta storage — **mirror to WORM media** and tie entry hashes to your "
+        "Part 11 / Annex 11 evidence packages in qualified deployments."
     )
+
+    theme.render_validation_footer(st)

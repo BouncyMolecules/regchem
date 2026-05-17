@@ -7,10 +7,9 @@ from dataclasses import dataclass
 
 from regchem_sentinel.config import Settings
 from regchem_sentinel.core.classifier import StartingMaterialClassifier, default_classifier
-from regchem_sentinel.core.models import (
-    ParsedSubmission,
-    SentinelPipelineSnapshot,
-)
+# Importing payloads from ``core.models`` loads every SQLModel table (graph ledger, audit trails, pipeline rows)
+# onto ``SQLModel.metadata`` — keep ORM centralized; graph-memory / continual-learning code uses snapshot types only.
+from regchem_sentinel.core.models import ParsedSubmission, SentinelPipelineSnapshot
 from regchem_sentinel.core.storage import (
     RegulatoryAuditStorage,
     create_memory_storage,
@@ -98,10 +97,12 @@ def run_pipeline(
         verifications=verifications,
     )
 
+    run_id: str | None = None
     if persist:
         if storage_writer:
             storage_writer(deps.storage, snapshot)
         else:
-            deps.storage.append_snapshot(snapshot)
+            run_id = deps.storage.append_snapshot(snapshot)
+    deps.storage.append_graph_memory(snapshot, pipeline_run_id=run_id)
 
     return snapshot

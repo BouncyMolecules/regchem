@@ -32,9 +32,12 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlmodel import Session, SQLModel, create_engine, select
 
+from regchem_sentinel.core import continual_learning as cl
+from regchem_sentinel.core import graph_memory as gm
 from regchem_sentinel.core.models import (
     AuditTrailEntry,
     ClassificationResultRecord,
+    GraphMemoryLedgerEntry,
     ParsedSubmission,
     ParsedSubmissionRecord,
     PipelineRunRecord,
@@ -45,6 +48,53 @@ from regchem_sentinel.core.models import (
     VerificationAssertionRecord,
     VerificationCueResultRecord,
 )
+
+_GRAPH_USER_ACTION = "CLASSIFY_PIPELINE_RUN"
+_GRAPH_FEEDBACK_EVENT = "HYPEREDGE_FEEDBACK_ADJUST"
+
+
+def _tier_touch_from_participants_json(payload: str) -> str | None:
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and "participants" in data:
+        rows = cast(list[dict[str, object]], data["participants"])
+    elif isinstance(data, list):
+        rows = cast(list[dict[str, object]], data)
+    else:
+        return None
+    for row in rows:
+        if row.get("role") != "REGULATORY_CONTEXT":
+            continue
+        label_obj = row.get("label")
+        if not isinstance(label_obj, str):
+            continue
+        label = label_obj
+        if label.startswith("material_tier:"):
+            return label.split(":", 1)[1]
+    return None
+
+
+def _graph_corpus_from_rows(
+    rows: Iterable[tuple[str, str]],
+) -> gm.GraphCorpusStats:
+    """Build corpus mirrors from (hyperedge_key, participants_json) ledger projections."""
+
+    tier_counts: dict[str, int] = {}
+    keys: set[str] = set()
+    total = 0
+    for hyper_key, participants_json in rows:
+        total += 1
+        keys.add(hyper_key)
+        tier = _tier_touch_from_participants_json(participants_json)
+        if tier is not None:
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+    return gm.GraphCorpusStats(
+        total_ledger_events=total,
+        distinct_hyperedge_keys=len(keys),
+        tier_touch_counts=tier_counts,
+    )
 
 
 def _sql_col(model: type[SQLModel], field_name: str) -> ColumnElement[Any]:
@@ -168,8 +218,34 @@ class _RecentRunPayload(TypedDict):
 class RegulatoryAuditStorage(Protocol):
     """Minimal persistence port consumed by orchestration."""
 
-    def append_snapshot(self, snapshot: SentinelPipelineSnapshot) -> None:
-        """Persist a completed end-to-end pipeline bundle."""
+    def append_snapshot(self, snapshot: SentinelPipelineSnapshot) -> str | None:
+        """Persist a completed end-to-end pipeline bundle; returns run id when known."""
+
+    def append_graph_memory(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> gm.GraphMemoryWriteSummary:
+        """Append-only hypergraph upserts (workshop mode or explicit replays)."""
+
+    def append_classification_feedback(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        kind: cl.FeedbackKind,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> cl.GraphFeedbackWriteSummary:
+        """Record reviewer feedback as deterministic hyperedge strength adjustments."""
+
+    def last_graph_memory_write(self) -> gm.GraphMemoryWriteSummary | None:
+        """Most recent graph write summary (process-local; for UI scaffolding)."""
+
+    def graph_memory_corpus_stats(self) -> gm.GraphCorpusStats:
+        """Aggregated ledger statistics for MirrorMind-style benchmarks."""
+
+    def last_persisted_pipeline_run_id(self) -> str | None:
+        """Most recent pipeline run id from durable snapshot persistence, if known."""
 
     def recent_runs(self, *, limit: int = 20) -> list[dict[str, object]]:
         """Return newest-first lightweight dict rows suitable for dashboards."""
@@ -193,8 +269,154 @@ class InMemoryAuditStorage:
         self._ledger: list[AuditTrailView] = []
         self._next_entry_id = 1
         self._prior_ledger_hash: str | None = None
+        self._graph_rows: list[dict[str, object]] = []
+        self._graph_next_entry_id = 1
+        self._graph_prior_chain_hash: str | None = None
+        self._last_graph_summary: gm.GraphMemoryWriteSummary | None = None
+        self._last_persisted_pipeline_run_id: str | None = None
 
-    def append_snapshot(self, snapshot: SentinelPipelineSnapshot) -> None:
+    def _memory_latest_hyperedge(self, hyper_key: str) -> tuple[float, str] | None:
+        for row in reversed(self._graph_rows):
+            if cast(str, row["hyperedge_key_sha256"]) == hyper_key:
+                return (
+                    cast(float, row["strength_after"]),
+                    cast(str, row["hyperedge_state_hash_hex"]),
+                )
+        return None
+
+    def _memory_latest_graph_row(self, hyper_key: str) -> dict[str, object] | None:
+        for row in reversed(self._graph_rows):
+            if cast(str, row["hyperedge_key_sha256"]) == hyper_key:
+                return row
+        return None
+
+    def _flush_graph_memory(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        pipeline_run_id: str | None,
+    ) -> gm.GraphMemoryWriteSummary:
+        specs = gm.derive_hyperedge_upserts(snapshot)
+        runner_hash = self._graph_prior_chain_hash
+        local_state: dict[str, tuple[float, str]] = {}
+        new_keys = 0
+        strengthened = 0
+        public_ids: list[str] = []
+        max_strength = 0.0
+        rel_accum: list[str] = []
+        created_at = datetime.now(UTC)
+
+        for spec in specs:
+            key = spec.hyperedge_key_sha256
+            if key in local_state:
+                strength_before, prev_hyper_hash = local_state[key]
+                strengthened += 1
+            else:
+                mem = self._memory_latest_hyperedge(key)
+                if mem is not None:
+                    strength_before, prev_hyper_hash = mem
+                    strengthened += 1
+                else:
+                    strength_before = 0.0
+                    prev_hyper_hash = ""
+                    new_keys += 1
+
+            previous_hyperedge_state = prev_hyper_hash if prev_hyper_hash else None
+
+            strength_after = round(strength_before + spec.strength_delta, 6)
+            max_strength = max(max_strength, strength_after)
+            rel_accum.append(spec.relation_type)
+            public_id = gm.new_public_id()
+            public_ids.append(public_id)
+
+            payload_model = gm.build_ledger_payload(
+                spec=spec,
+                snapshot=snapshot,
+                pipeline_run_id=pipeline_run_id,
+                user_action=_GRAPH_USER_ACTION,
+                strength_before=strength_before,
+                strength_after=strength_after,
+                previous_hyperedge_state_hash_hex=previous_hyperedge_state,
+                public_id=public_id,
+            )
+            payload_dict = gm.payload_to_canonical_dict(payload_model)
+            participants_json = _stable_json_dumps(
+                cast(
+                    dict[str, object],
+                    {"participants": [dict(p) for p in spec.participants]},
+                ),
+            )
+            payload_json = _stable_json_dumps(cast(dict[str, object], payload_dict))
+            entry_hash = gm.ledger_entry_hash(
+                previous_ledger_hash_hex=runner_hash,
+                payload_json=payload_json,
+            )
+
+            row = {
+                "entry_id": self._graph_next_entry_id,
+                "public_id": public_id,
+                "created_at_utc": created_at,
+                "event_type": "HYPEREDGE_UPSERT",
+                "user_action": _GRAPH_USER_ACTION,
+                "correlation_id": snapshot.correlation_id,
+                "pipeline_run_id": pipeline_run_id,
+                "snapshot_canonical_sha256": payload_model.snapshot_canonical_sha256,
+                "hyperedge_key_sha256": key,
+                "relation_type": spec.relation_type,
+                "strength_before": strength_before,
+                "strength_delta": payload_model.strength_delta,
+                "strength_after": strength_after,
+                "participants_canonical_json": participants_json,
+                "previous_hyperedge_state_hash_hex": previous_hyperedge_state,
+                "hyperedge_state_hash_hex": payload_model.hyperedge_state_hash_hex,
+                "payload_json": payload_json,
+                "previous_ledger_hash_hex": runner_hash,
+                "entry_hash_hex": entry_hash,
+            }
+            self._graph_rows.append(row)
+            self._graph_next_entry_id += 1
+            runner_hash = entry_hash
+            local_state[key] = (strength_after, payload_model.hyperedge_state_hash_hex)
+
+        self._graph_prior_chain_hash = runner_hash
+
+        seen_rel: set[str] = set()
+        uniq_rel: list[str] = []
+        for rel in rel_accum:
+            if rel not in seen_rel:
+                seen_rel.add(rel)
+                uniq_rel.append(rel)
+
+        summary = gm.compute_write_summary(
+            snapshot=snapshot,
+            entry_public_ids=tuple(public_ids),
+            last_entry_hash=runner_hash,
+            new_keys=new_keys,
+            strengthened_keys=strengthened,
+            max_strength=max_strength,
+            relation_kinds=tuple(uniq_rel),
+        )
+        self._last_graph_summary = summary
+        return summary
+
+    def append_graph_memory(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> gm.GraphMemoryWriteSummary:
+        return self._flush_graph_memory(snapshot, pipeline_run_id)
+
+    def last_graph_memory_write(self) -> gm.GraphMemoryWriteSummary | None:
+        return self._last_graph_summary
+
+    def graph_memory_corpus_stats(self) -> gm.GraphCorpusStats:
+        projection = [
+            (cast(str, row["hyperedge_key_sha256"]), cast(str, row["participants_canonical_json"]))
+            for row in self._graph_rows
+        ]
+        return _graph_corpus_from_rows(projection)
+
+    def append_snapshot(self, snapshot: SentinelPipelineSnapshot) -> str | None:
         """Store the authoritative tuple-friendly projection used by history pages."""
 
         digest, _ = _snapshot_sha256(snapshot)
@@ -245,6 +467,129 @@ class InMemoryAuditStorage:
         self._ledger.append(ledger_view)
         self._prior_ledger_hash = entry_hash
         self._next_entry_id += 1
+        self._last_persisted_pipeline_run_id = run_id
+        return run_id
+
+    def last_persisted_pipeline_run_id(self) -> str | None:
+        return self._last_persisted_pipeline_run_id
+
+    def append_classification_feedback(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        kind: cl.FeedbackKind,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> cl.GraphFeedbackWriteSummary:
+        specs = gm.derive_hyperedge_upserts(snapshot)
+        if not specs:
+            return cl.GraphFeedbackWriteSummary(
+                feedback_bundle_public_id=gm.new_public_id(),
+                feedback_kind=kind,
+                snapshot_canonical_sha256=gm.snapshot_canonical_sha256(snapshot),
+                hyperedge_events=0,
+                entry_public_ids=(),
+                last_ledger_entry_hash_hex=self._graph_prior_chain_hash,
+            )
+
+        targeted = tuple(s.hyperedge_key_sha256 for s in specs)
+        bundle_id = gm.new_public_id()
+        created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        primary_mat = snapshot.findings[0].canonical_name.strip() if snapshot.findings else ""
+
+        runner_hash = self._graph_prior_chain_hash
+        public_ids: list[str] = []
+        stamp = datetime.now(UTC)
+
+        for spec in specs:
+            row_prev = self._memory_latest_graph_row(spec.hyperedge_key_sha256)
+            if row_prev is not None:
+                strength_before = cast(float, row_prev["strength_after"])
+                prev_hyper_hash = cast(str, row_prev["hyperedge_state_hash_hex"])
+            else:
+                strength_before = 0.0
+                prev_hyper_hash = ""
+
+            previous_hyperedge_state = prev_hyper_hash if prev_hyper_hash else None
+            strength_after, applied_delta = cl.apply_feedback_to_hyperedge_strength(
+                strength_before=strength_before,
+                kind=kind,
+            )
+
+            public_id = gm.new_public_id()
+            public_ids.append(public_id)
+
+            gf_entry = cl.GraphFeedbackEntry(
+                feedback_bundle_public_id=bundle_id,
+                feedback_kind=kind,
+                correlation_id=snapshot.correlation_id,
+                pipeline_run_id=pipeline_run_id,
+                snapshot_canonical_sha256=gm.snapshot_canonical_sha256(snapshot),
+                primary_material_canonical=primary_mat[:1024],
+                targeted_hyperedge_keys_sha256=targeted,
+                hyperedge_key_sha256=spec.hyperedge_key_sha256,
+                relation_type=spec.relation_type,
+                applied_strength_delta=applied_delta,
+                created_at_utc=created_at,
+            )
+            payload_dict = cl.build_feedback_payload_dict(
+                snapshot=snapshot,
+                spec=spec,
+                pipeline_run_id=pipeline_run_id,
+                strength_before=strength_before,
+                strength_after=strength_after,
+                strength_delta=applied_delta,
+                previous_hyperedge_state_hash_hex=previous_hyperedge_state,
+                public_id=public_id,
+                graph_feedback_entry=gf_entry,
+            )
+            payload_json = _stable_json_dumps(cast(dict[str, object], payload_dict))
+            entry_hash = gm.ledger_entry_hash(
+                previous_ledger_hash_hex=runner_hash,
+                payload_json=payload_json,
+            )
+
+            participants_json = _stable_json_dumps(
+                cast(
+                    dict[str, object],
+                    {"participants": [dict(p) for p in spec.participants]},
+                ),
+            )
+
+            row = {
+                "entry_id": self._graph_next_entry_id,
+                "public_id": public_id,
+                "created_at_utc": stamp,
+                "event_type": _GRAPH_FEEDBACK_EVENT,
+                "user_action": "USER_CLASSIFICATION_FEEDBACK",
+                "correlation_id": snapshot.correlation_id,
+                "pipeline_run_id": pipeline_run_id,
+                "snapshot_canonical_sha256": gm.snapshot_canonical_sha256(snapshot),
+                "hyperedge_key_sha256": spec.hyperedge_key_sha256,
+                "relation_type": spec.relation_type,
+                "strength_before": strength_before,
+                "strength_delta": applied_delta,
+                "strength_after": strength_after,
+                "participants_canonical_json": participants_json,
+                "previous_hyperedge_state_hash_hex": previous_hyperedge_state,
+                "hyperedge_state_hash_hex": cast(str, payload_dict["hyperedge_state_hash_hex"]),
+                "payload_json": payload_json,
+                "previous_ledger_hash_hex": runner_hash,
+                "entry_hash_hex": entry_hash,
+            }
+            self._graph_rows.append(row)
+            self._graph_next_entry_id += 1
+            runner_hash = entry_hash
+
+        self._graph_prior_chain_hash = runner_hash
+
+        return cl.GraphFeedbackWriteSummary(
+            feedback_bundle_public_id=bundle_id,
+            feedback_kind=kind,
+            snapshot_canonical_sha256=gm.snapshot_canonical_sha256(snapshot),
+            hyperedge_events=len(public_ids),
+            entry_public_ids=tuple(public_ids),
+            last_ledger_entry_hash_hex=runner_hash,
+        )
 
     def recent_runs(self, *, limit: int = 20) -> list[dict[str, object]]:
         if limit < 1:
@@ -280,6 +625,8 @@ class StorageService:
         """Initialise bound to *engine* and materialise schemas if missing."""
 
         self._engine = engine
+        self._last_graph_summary: gm.GraphMemoryWriteSummary | None = None
+        self._last_persisted_pipeline_run_id: str | None = None
         self.ensure_schema()
 
     @property
@@ -309,6 +656,318 @@ class StorageService:
         if row is None:
             return None
         return row.entry_hash_hex
+
+    def _latest_graph_ledger_hash_sql(self, session: Session) -> str | None:
+        stmt = (
+            select(GraphMemoryLedgerEntry)
+            .order_by(desc(_sql_col(GraphMemoryLedgerEntry, "entry_id")))
+            .limit(1)
+        )
+        row = session.exec(stmt).first()
+        if row is None:
+            return None
+        return row.entry_hash_hex
+
+    def _latest_hyperedge_sql(self, session: Session, hyper_key: str) -> tuple[float, str] | None:
+        stmt = (
+            select(GraphMemoryLedgerEntry)
+            .where(GraphMemoryLedgerEntry.hyperedge_key_sha256 == hyper_key)
+            .order_by(desc(_sql_col(GraphMemoryLedgerEntry, "entry_id")))
+            .limit(1)
+        )
+        row = session.exec(stmt).first()
+        if row is None:
+            return None
+        return (row.strength_after, row.hyperedge_state_hash_hex)
+
+    def _latest_graph_memory_entry_sql(
+        self,
+        session: Session,
+        hyper_key: str,
+    ) -> GraphMemoryLedgerEntry | None:
+        stmt = (
+            select(GraphMemoryLedgerEntry)
+            .where(GraphMemoryLedgerEntry.hyperedge_key_sha256 == hyper_key)
+            .order_by(desc(_sql_col(GraphMemoryLedgerEntry, "entry_id")))
+            .limit(1)
+        )
+        return session.exec(stmt).first()
+
+    def _flush_graph_memory_sqlite(
+        self,
+        session: Session,
+        snapshot: SentinelPipelineSnapshot,
+        pipeline_run_id: str | None,
+    ) -> gm.GraphMemoryWriteSummary:
+        specs = gm.derive_hyperedge_upserts(snapshot)
+        runner_hash = self._latest_graph_ledger_hash_sql(session)
+        local_state: dict[str, tuple[float, str]] = {}
+        new_keys = 0
+        strengthened = 0
+        public_ids: list[str] = []
+        max_strength = 0.0
+        rel_accum: list[str] = []
+        created_at = datetime.now(UTC)
+
+        for spec in specs:
+            key = spec.hyperedge_key_sha256
+            if key in local_state:
+                strength_before, prev_hyper_hash = local_state[key]
+                strengthened += 1
+            else:
+                mem = self._latest_hyperedge_sql(session, key)
+                if mem is not None:
+                    strength_before, prev_hyper_hash = mem
+                    strengthened += 1
+                else:
+                    strength_before = 0.0
+                    prev_hyper_hash = ""
+                    new_keys += 1
+
+            previous_hyperedge_state = prev_hyper_hash if prev_hyper_hash else None
+
+            strength_after = round(strength_before + spec.strength_delta, 6)
+            max_strength = max(max_strength, strength_after)
+            rel_accum.append(spec.relation_type)
+            public_id = gm.new_public_id()
+            public_ids.append(public_id)
+
+            payload_model = gm.build_ledger_payload(
+                spec=spec,
+                snapshot=snapshot,
+                pipeline_run_id=pipeline_run_id,
+                user_action=_GRAPH_USER_ACTION,
+                strength_before=strength_before,
+                strength_after=strength_after,
+                previous_hyperedge_state_hash_hex=previous_hyperedge_state,
+                public_id=public_id,
+            )
+            payload_dict = gm.payload_to_canonical_dict(payload_model)
+            participants_json = _stable_json_dumps(
+                cast(
+                    dict[str, object],
+                    {"participants": [dict(p) for p in spec.participants]},
+                ),
+            )
+            payload_json = _stable_json_dumps(cast(dict[str, object], payload_dict))
+            entry_hash = gm.ledger_entry_hash(
+                previous_ledger_hash_hex=runner_hash,
+                payload_json=payload_json,
+            )
+
+            session.add(
+                GraphMemoryLedgerEntry(
+                    public_id=public_id,
+                    created_at_utc=created_at,
+                    event_type="HYPEREDGE_UPSERT",
+                    user_action=_GRAPH_USER_ACTION,
+                    correlation_id=snapshot.correlation_id,
+                    pipeline_run_id=pipeline_run_id,
+                    snapshot_canonical_sha256=payload_model.snapshot_canonical_sha256,
+                    hyperedge_key_sha256=key,
+                    relation_type=spec.relation_type,
+                    strength_before=strength_before,
+                    strength_delta=payload_model.strength_delta,
+                    strength_after=strength_after,
+                    participants_canonical_json=participants_json,
+                    previous_hyperedge_state_hash_hex=previous_hyperedge_state,
+                    hyperedge_state_hash_hex=payload_model.hyperedge_state_hash_hex,
+                    payload_json=payload_json,
+                    previous_ledger_hash_hex=runner_hash,
+                    entry_hash_hex=entry_hash,
+                ),
+            )
+            runner_hash = entry_hash
+            local_state[key] = (strength_after, payload_model.hyperedge_state_hash_hex)
+
+        seen_rel: set[str] = set()
+        uniq_rel: list[str] = []
+        for rel in rel_accum:
+            if rel not in seen_rel:
+                seen_rel.add(rel)
+                uniq_rel.append(rel)
+
+        return gm.compute_write_summary(
+            snapshot=snapshot,
+            entry_public_ids=tuple(public_ids),
+            last_entry_hash=runner_hash,
+            new_keys=new_keys,
+            strengthened_keys=strengthened,
+            max_strength=max_strength,
+            relation_kinds=tuple(uniq_rel),
+        )
+
+    def append_graph_memory_snapshot(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> gm.GraphMemoryWriteSummary:
+        """Persist hypergraph upserts without requiring a pipeline row (workshop mode)."""
+
+        try:
+            with Session(self._engine) as session:
+                summary = self._flush_graph_memory_sqlite(session, snapshot, pipeline_run_id)
+                session.commit()
+        except SQLAlchemyError as exc:
+            msg = "Unexpected relational engine failure while persisting hypergraph ledger."
+            raise StorageWriteError(msg) from exc
+        self._last_graph_summary = summary
+        return summary
+
+    def append_classification_feedback(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        kind: cl.FeedbackKind,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> cl.GraphFeedbackWriteSummary:
+        specs = gm.derive_hyperedge_upserts(snapshot)
+        try:
+            with Session(self._engine) as session:
+                if not specs:
+                    bundle = gm.new_public_id()
+                    summary = cl.GraphFeedbackWriteSummary(
+                        feedback_bundle_public_id=bundle,
+                        feedback_kind=kind,
+                        snapshot_canonical_sha256=gm.snapshot_canonical_sha256(snapshot),
+                        hyperedge_events=0,
+                        entry_public_ids=(),
+                        last_ledger_entry_hash_hex=self._latest_graph_ledger_hash_sql(session),
+                    )
+                    session.commit()
+                    return summary
+
+                targeted = tuple(s.hyperedge_key_sha256 for s in specs)
+                bundle_id = gm.new_public_id()
+                created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                primary_mat = (
+                    snapshot.findings[0].canonical_name.strip() if snapshot.findings else ""
+                )
+
+                runner_hash = self._latest_graph_ledger_hash_sql(session)
+                public_ids: list[str] = []
+                stamp = datetime.now(UTC)
+
+                for spec in specs:
+                    prev_row = self._latest_graph_memory_entry_sql(
+                        session,
+                        spec.hyperedge_key_sha256,
+                    )
+                    if prev_row is not None:
+                        strength_before = prev_row.strength_after
+                        prev_hyper_hash = prev_row.hyperedge_state_hash_hex
+                    else:
+                        strength_before = 0.0
+                        prev_hyper_hash = ""
+
+                    previous_hyperedge_state = prev_hyper_hash if prev_hyper_hash else None
+                    strength_after, applied_delta = cl.apply_feedback_to_hyperedge_strength(
+                        strength_before=strength_before,
+                        kind=kind,
+                    )
+
+                    public_id = gm.new_public_id()
+                    public_ids.append(public_id)
+
+                    gf_entry = cl.GraphFeedbackEntry(
+                        feedback_bundle_public_id=bundle_id,
+                        feedback_kind=kind,
+                        correlation_id=snapshot.correlation_id,
+                        pipeline_run_id=pipeline_run_id,
+                        snapshot_canonical_sha256=gm.snapshot_canonical_sha256(snapshot),
+                        primary_material_canonical=primary_mat[:1024],
+                        targeted_hyperedge_keys_sha256=targeted,
+                        hyperedge_key_sha256=spec.hyperedge_key_sha256,
+                        relation_type=spec.relation_type,
+                        applied_strength_delta=applied_delta,
+                        created_at_utc=created_at,
+                    )
+                    payload_dict = cl.build_feedback_payload_dict(
+                        snapshot=snapshot,
+                        spec=spec,
+                        pipeline_run_id=pipeline_run_id,
+                        strength_before=strength_before,
+                        strength_after=strength_after,
+                        strength_delta=applied_delta,
+                        previous_hyperedge_state_hash_hex=previous_hyperedge_state,
+                        public_id=public_id,
+                        graph_feedback_entry=gf_entry,
+                    )
+                    payload_json = _stable_json_dumps(cast(dict[str, object], payload_dict))
+                    entry_hash = gm.ledger_entry_hash(
+                        previous_ledger_hash_hex=runner_hash,
+                        payload_json=payload_json,
+                    )
+                    participants_json = _stable_json_dumps(
+                        cast(
+                            dict[str, object],
+                            {"participants": [dict(p) for p in spec.participants]},
+                        ),
+                    )
+
+                    session.add(
+                        GraphMemoryLedgerEntry(
+                            public_id=public_id,
+                            created_at_utc=stamp,
+                            event_type=_GRAPH_FEEDBACK_EVENT,
+                            user_action="USER_CLASSIFICATION_FEEDBACK",
+                            correlation_id=snapshot.correlation_id,
+                            pipeline_run_id=pipeline_run_id,
+                            snapshot_canonical_sha256=gm.snapshot_canonical_sha256(snapshot),
+                            hyperedge_key_sha256=spec.hyperedge_key_sha256,
+                            relation_type=spec.relation_type,
+                            strength_before=strength_before,
+                            strength_delta=applied_delta,
+                            strength_after=strength_after,
+                            participants_canonical_json=participants_json,
+                            previous_hyperedge_state_hash_hex=previous_hyperedge_state,
+                            hyperedge_state_hash_hex=cast(
+                                str,
+                                payload_dict["hyperedge_state_hash_hex"],
+                            ),
+                            payload_json=payload_json,
+                            previous_ledger_hash_hex=runner_hash,
+                            entry_hash_hex=entry_hash,
+                        ),
+                    )
+                    runner_hash = entry_hash
+
+                out = cl.GraphFeedbackWriteSummary(
+                    feedback_bundle_public_id=bundle_id,
+                    feedback_kind=kind,
+                    snapshot_canonical_sha256=gm.snapshot_canonical_sha256(snapshot),
+                    hyperedge_events=len(public_ids),
+                    entry_public_ids=tuple(public_ids),
+                    last_ledger_entry_hash_hex=runner_hash,
+                )
+                session.commit()
+        except SQLAlchemyError as exc:
+            msg = "Unexpected relational engine failure while persisting feedback ledger rows."
+            raise StorageWriteError(msg) from exc
+
+        return out
+
+    def last_graph_memory_write(self) -> gm.GraphMemoryWriteSummary | None:
+        """Most recent SQLite graph write (same process lifetime)."""
+
+        return self._last_graph_summary
+
+    def graph_memory_corpus_stats(self) -> gm.GraphCorpusStats:
+        """Aggregate hypergraph ledger rows into cohort mirrors."""
+
+        stmt = select(GraphMemoryLedgerEntry)
+        try:
+            with Session(self._engine) as session:
+                entries = list(session.exec(stmt).all())
+        except SQLAlchemyError as exc:  # pragma: no cover
+            msg = "Failed querying hypergraph ledger projections."
+            raise StorageError(msg) from exc
+
+        projection: list[tuple[str, str]] = [
+            (e.hyperedge_key_sha256, e.participants_canonical_json) for e in entries
+        ]
+        return _graph_corpus_from_rows(projection)
 
     def save_pipeline_snapshot(self, snapshot: SentinelPipelineSnapshot) -> str:
         """Atomically persist *snapshot*, returning ``pipeline_run.id``.
@@ -487,7 +1146,11 @@ class StorageService:
             msg = "Unexpected relational engine failure while persisting Sentinel snapshot."
             raise StorageWriteError(msg) from exc
 
+        self._last_persisted_pipeline_run_id = run_id
         return run_id
+
+    def last_persisted_pipeline_run_id(self) -> str | None:
+        return self._last_persisted_pipeline_run_id
 
     def get_latest_for_correlation_id(self, correlation_id: str) -> SentinelPipelineSnapshot | None:
         """Return newest persisted snapshot matching *correlation_id*, if any."""
@@ -679,8 +1342,41 @@ class SqliteRegulatoryAuditStorage:
 
         return self._svc
 
-    def append_snapshot(self, snapshot: SentinelPipelineSnapshot) -> None:
-        self._svc.save_pipeline_snapshot(snapshot)
+    def append_snapshot(self, snapshot: SentinelPipelineSnapshot) -> str | None:
+        return self._svc.save_pipeline_snapshot(snapshot)
+
+    def append_graph_memory(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> gm.GraphMemoryWriteSummary:
+        return self._svc.append_graph_memory_snapshot(
+            snapshot,
+            pipeline_run_id=pipeline_run_id,
+        )
+
+    def append_classification_feedback(
+        self,
+        snapshot: SentinelPipelineSnapshot,
+        kind: cl.FeedbackKind,
+        *,
+        pipeline_run_id: str | None = None,
+    ) -> cl.GraphFeedbackWriteSummary:
+        return self._svc.append_classification_feedback(
+            snapshot,
+            kind,
+            pipeline_run_id=pipeline_run_id,
+        )
+
+    def last_graph_memory_write(self) -> gm.GraphMemoryWriteSummary | None:
+        return self._svc.last_graph_memory_write()
+
+    def graph_memory_corpus_stats(self) -> gm.GraphCorpusStats:
+        return self._svc.graph_memory_corpus_stats()
+
+    def last_persisted_pipeline_run_id(self) -> str | None:
+        return self._svc.last_persisted_pipeline_run_id()
 
     def recent_runs(self, *, limit: int = 20) -> list[dict[str, object]]:
         return self._svc.recent_runs_dict(limit=limit)

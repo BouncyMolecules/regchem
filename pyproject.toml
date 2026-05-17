@@ -9,7 +9,7 @@ description = "Auditable decision-support for Starting Material and supplier cue
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
-authors = [{ name = "RegChem Sentinel Maintainers" }]
+authors = [{ name = "Quanta Maintainers" }]
 keywords = [
     "compliance",
     "gxp",

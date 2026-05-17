@@ -20,9 +20,9 @@ def _coerce_int(value: object, *, default: int = 0) -> int:
 
 
 def preferences_path() -> Path:
-    """User-local Sentinel UX preferences (not regulated records)."""
+    """User-local Quanta UX preferences (not regulated records)."""
 
-    return Path.home() / ".regchem-sentinel" / "preferences.json"
+    return Path.home() / ".quanta" / "preferences.json"
 
 
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
@@ -80,10 +80,10 @@ class _OnboardingSlide:
 
 _SLIDES: tuple[_OnboardingSlide, ...] = (
     _OnboardingSlide(
-        title="Welcome to RegChem Sentinel",
+        title="Welcome to Quanta",
         subtitle="Traceable CMC starting-material decision support",
         body=(
-            "Sentinel ingests narrative Chemistry, Manufacturing, and Controls (CMC) text, "
+            "Quanta ingests narrative Chemistry, Manufacturing, and Controls (CMC) text, "
             "surfaces Starting Material cues with explicit excerpt provenance, links supplier "
             "language, and checkpoints outputs through a verifier layer before persistence."
         ),
@@ -111,7 +111,7 @@ _SLIDES: tuple[_OnboardingSlide, ...] = (
         subtitle="Map limitations to your CSV program",
         body=(
             "This build is not certified for Part 11 on its own. Configure environment controls, "
-            "access governance, anomaly handling, backups, and record retention upstream—Sentinel "
+            "access governance, anomaly handling, backups, and record retention upstream — Quanta "
             "is scaffolding you qualify within your computerized system validation lifecycle."
         ),
     ),
@@ -124,17 +124,12 @@ def render_gxp_banner(st: Any) -> None:
     st.markdown(
         """
         <div class="regchem-banner">
-            <strong>Governance reminder:</strong> RegChem Sentinel provides contextual decision
-            support only. It is not intended as a validated system of record, does not replace
-            qualified human review, and must not be used as the sole basis for regulatory filings
-            or GxP decisions unless governed by your quality system.
+            <strong>For decision-support only.</strong> Quanta is not a validated system of record, does not replace
+            qualified human review, and is not the sole basis for regulatory filings. Map every output to controlled
+            sources and govern deployment under your CSV / data-integrity programme.
         </div>
         """,
         unsafe_allow_html=True,
-    )
-    st.caption(
-        "Map every automated output to source text, retain audit trails, and follow your "
-        "SOPs for computer system validation (CSV) and data integrity (ALCOA+)."
     )
 
 

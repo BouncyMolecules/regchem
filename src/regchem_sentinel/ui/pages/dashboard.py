@@ -96,10 +96,11 @@ def _priority_queue_rows(runs: list[dict[str, object]], *, limit: int = 25) -> l
 
 
 def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
-    st.title("Monitored portfolio")
-    st.caption(
-        "Session-scoped metrics derived from stored pipeline snapshots. "
-        "Pair with your QMS for controlled trending over longer horizons."
+    st.markdown(
+        '<p class="regchem-page-lede" style="margin-top:0.25rem;">Prioritise correlations that need SME '
+        "attention before weekly RegOps forums. Metrics are <strong>session-scoped</strong> — pair with your QMS for "
+        "longer baselines.</p>",
+        unsafe_allow_html=True,
     )
 
     try:
@@ -111,9 +112,9 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
 
     if not runs:
         st.warning(
-            "No pipeline snapshots yet — run classification to populate KPIs "
-            "and risk posture signals."
+            "No pipeline snapshots yet — start in **New classification** to populate portfolio telemetry."
         )
+        theme.render_validation_footer(st)
         st.stop()
 
     total_findings = 0
@@ -158,12 +159,12 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
         theme.render_kpi_card(cols[0], title="Tracked runs", value=f"{len(runs)}", band="neutral")
         with st.expander("ℹ KPI — tracked runs", expanded=False):
             st.markdown(
-                "**Measures:** count of Sentinel pipeline executions retained in this session's storage "
+                "**Measures:** count of Quanta pipeline executions retained in this session's storage "
                 "(SQLite WAL or in-memory ledger)."
             )
             st.markdown(
                 "**2026 reference band:** modest CMC churn teams executing narrative QA often accumulate "
-                "**≈18–52 stored bursts per fiscal quarter**, spiking ahead of filings — Sentinel does not infer "
+                "**≈18–52 stored bursts per fiscal quarter**, spiking ahead of filings — Quanta does not infer "
                 "calendar windows without external timestamps."
             )
             st.markdown(
@@ -250,10 +251,10 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
                 "to keep this posture."
             st.markdown(f"**Your reading:** **`{rejected_total}`** rejections tally — {verdict}")
 
-    st.markdown("##### Priority queue")
+    st.markdown("##### Today’s triage queue")
     st.caption(
-        "Correlations surfaced by verifier escalation or heuristic low classifier aggregates — prioritize "
-        "before closing weekly RegOps dashboards."
+        "Surfaces correlations with verifier escalation or softer classifier aggregates — **decision-support "
+        "routing only**, not a filing readiness verdict."
     )
     queue_preview = _priority_queue_rows(runs)
     if queue_preview:
@@ -300,22 +301,29 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
         )
         st.markdown(
             f"**Your reading:** {labels[posture]} Accepted vs escalation mix should be mirrored in QA trending "
-            "tools — Sentinel only mirrors what was last persisted."
+            "tools — Quanta only mirrors what was last persisted."
         )
 
-    st.markdown("##### Latest correlation")
-    with st.expander(f"Correlation `{latest_corr}` · detail", expanded=False):
-        st.write(
+    st.markdown("##### Latest execution · provenance snapshot")
+    with st.expander(
+        f"Correlation `{latest_corr}` — identifiers & digests",
+        expanded=False,
+    ):
+        st.markdown(
             f"**Correlation ID:** `{latest_corr}`  \n"
-            f"**Last opened:** {_format_ts(latest.get('created_at_utc', ''))}  \n"
-            f"**Content SHA-256:** `{latest.get('content_sha256', '—')}`  \n"
-            f"**Snapshot digest:** `{latest.get('snapshot_canonical_sha256', '—')}`"
+            f"**Last opened (UTC):** {_format_ts(latest.get('created_at_utc', ''))}  \n"
+            f"**Submission content SHA-256:** `{latest.get('content_sha256', '—')}`  \n"
+            f"**Canonical snapshot digest:** `{latest.get('snapshot_canonical_sha256', '—')}`"
         )
-        with st.expander("ℹ How to operationalize this artefact", expanded=False):
+        st.caption(
+            "Use these fingerprints when attaching Quanta output to deviations, change records, or inspection "
+            "response binders — mirror language in your validated tracker."
+        )
+        with st.expander("How to operationalize this artefact", expanded=False):
             st.markdown(
                 "- **Correlation ID** anchors ECM / deviations / QA tracker rows — never rewrite post-sign-off.\n"
-                "- **Content SHA** demonstrates immutability of the narrative hashed for this Sentinel pass.\n"
-                "- Benchmarking **against prior runs** relies on comparing digests stored in controlled repo exports."
+                "- **Content SHA-256** fingerprints the verbatim narrative span hashed for this Quanta pass.\n"
+                "- **Canonical snapshot digest** locks the structured bundle exactly as persisted for replay."
             )
 
     st.markdown("##### Risk trajectory (recent runs)")
@@ -354,24 +362,25 @@ def render(st: Any, *, deps: SentinelDependencies, settings: Settings) -> None:
         st.info("Need at least two stored runs to render a trajectory chart.")
 
     st.markdown("##### Operating envelope")
-    with st.expander("Operational envelope · controlled use", expanded=False):
+    with st.expander("Controlled-use narrative (RegOps)", expanded=False):
         st.markdown(
             """
-- Sentinel parses unstructured CMC text, fingerprints it, tiers Starting Material hypotheses,
+- Quanta parses unstructured CMC text, fingerprints it, tiers Starting Material hypotheses,
   links supplier wording, verifies structured checks, then persists hashed snapshots suitable
   for inspection readiness drills.
-- Results remain **deterministic scaffolding** intended for SMEs who map each row back to dossier-
+- Outputs remain **deterministic scaffolding** intended for SMEs who map each row back to dossier-
   controlled sources.
 """
         )
 
     env_posture = (
-        "Production-grade posture requested — "
+        "Production-grade posture — "
         if settings.app_env == "production"
-        else "Non-production telemetry — "
+        else "Non-production posture — "
     )
     st.info(
-        f"{env_posture}environment tag `{settings.app_env}` matched to build "
-        f"`{settings.build_id}`. "
-        "Retain change control evidence when promoting configuration between tiers."
+        f"{env_posture}**{settings.app_env}** · build **{settings.build_id}**. "
+        "Retain change-control evidence when promoting configuration between tiers."
     )
+
+    theme.render_validation_footer(st)

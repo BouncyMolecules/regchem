@@ -1,4 +1,4 @@
-"""RegChem Sentinel - Streamlit Cloud entrypoint (2026 best practice)."""
+"""Quanta - Streamlit Cloud entrypoint (2026 best practice)."""
 from __future__ import annotations
 import sys
 from pathlib import Path
@@ -13,7 +13,7 @@ try:
 except ImportError as exc:
     import streamlit as st  # noqa: E402
     st.error(
-        "❌ Failed to import RegChem Sentinel core modules.\n\n"
+        "❌ Failed to import Quanta application modules.\n\n"
         "This usually means dependencies were not installed.\n"
         "Please ensure the app is using the root requirements.txt and click 'Rebuild app'."
     )
